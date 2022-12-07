@@ -23,6 +23,7 @@ import * as cryptoutils from './crypto.js'
 const log = logging.createModuleLogger('y-webrtc')
 
 const messageSync = 0
+const messageSubdocSync = 2
 const messageQueryAwareness = 3
 const messageAwareness = 1
 const messageBcPeerId = 4
@@ -74,6 +75,19 @@ const readMessage = (room, buf, syncedCallback) => {
     case messageSync: {
       encoding.writeVarUint(encoder, messageSync)
       const syncMessageType = syncProtocol.readSyncMessage(decoder, encoder, doc, room)
+      if (syncMessageType === syncProtocol.messageYjsSyncStep2 && !room.synced) {
+        syncedCallback()
+      }
+      if (syncMessageType === syncProtocol.messageYjsSyncStep1) {
+        sendReply = true
+      }
+      break
+    }
+    case messageSubdocSync: {
+      encoding.writeVarUint(encoder, messageSync)
+      let subdocId = decoding.readVarString(decoder)
+      const subdoc = room.getSubdoc(subdocId)
+      const syncMessageType = syncProtocol.readSyncMessage(decoder, encoder, subdoc, room)
       if (syncMessageType === syncProtocol.messageYjsSyncStep2 && !room.synced) {
         syncedCallback()
       }
@@ -322,6 +336,18 @@ export class Room {
     this.mux = createMutex()
     this.bcconnected = false
     /**
+     * @type {Map<string, Y.Doc>}
+     */
+    this.subdocs = new Map()
+
+    /**
+     * @param {string} id
+     */
+    this.getSubdoc = (id) => {
+      return this.subdocs.get(id)
+    }
+
+    /**
      * @param {ArrayBuffer} data
      */
     this._bcSubscriber = data =>
@@ -345,6 +371,50 @@ export class Room {
       syncProtocol.writeUpdate(encoder, update)
       broadcastRoomMessage(this, encoding.toUint8Array(encoder))
     }
+
+    /**
+     * 
+     * @param {string} id 
+     */
+    this._getSubdocUpdateHandler = (id) => {
+      /**
+       * 
+       * @param {Uint8Array} update 
+       * @param {WebrtcProvider} origin 
+       */
+      const updateHandler = (update, origin) => {
+        const encoder = encoding.createEncoder()
+        encoding.writeVarUint(encoder, messageSubdocSync)
+        encoding.writeVarString(encoder, id)
+        syncProtocol.writeUpdate(encoder, update)
+        broadcastRoomMessage(this, encoding.toUint8Array(encoder))
+      }
+      return updateHandler
+    }
+
+
+    /**
+     * Watch for subdoc events and reconcile local state
+     */
+    this.doc.on('subdocs', ({ added, removed, loaded }) => {
+      added.forEach(subdoc => {
+        this.subdocs.set(subdoc.guid, subdoc)
+      })
+      removed.forEach(subdoc => {
+        subdoc.off('update', this._getSubdocUpdateHandler(subdoc.guid))
+        this.subdocs.delete(subdoc.guid)
+      })
+      loaded.forEach(subdoc => {
+        // always send sync step 1 when connected
+        const encoder = encoding.createEncoder()
+        encoding.writeVarUint(encoder, messageSubdocSync)
+        encoding.writeVarString(encoder, subdoc.guid)
+        syncProtocol.writeSyncStep1(encoder, subdoc)
+        broadcastBcMessage(this, encoding.toUint8Array(encoder))
+        subdoc.on('update', this._getSubdocUpdateHandler(subdoc.guid))
+      })
+    })
+
     /**
      * Listens to Awareness updates and sends them to remote peers
      *
